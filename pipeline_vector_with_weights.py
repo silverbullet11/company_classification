@@ -36,14 +36,24 @@ def restore_features_from_text(text):
     word_list = space_separated_string.split(' ')
     return word_list
 
-def restore_floats_from_text(text):
+def restore_floats_from_text(text, embedding_dim = 100):
     regex_to_list = r"[\[\',\]\(\)）（] "
-    space_separated_string = re.sub(regex_to_list, '', text)
-    if space_separated_string[-1] == ']':
-        space_separated_string = space_separated_string[:-1]
-    if space_separated_string[0] == '[':
-        space_separated_string = space_separated_string[1:]
+    try:
+        space_separated_string = re.sub(regex_to_list, '', text)
+    except:
+        print(text)
+        return np.zeros(embedding_dim)
+    space_separated_string = space_separated_string.replace('[', '')
+    space_separated_string = space_separated_string.replace(']', '')
+    # if space_separated_string[-1] == ']':
+    #     space_separated_string = space_separated_string[:-1]
+    # if space_separated_string[0] == '[':
+    #     space_separated_string = space_separated_string[1:]
     word_list = space_separated_string.split(' ')
+    try:
+        [float(w) for w in word_list if w != ""]
+    except:
+        print(text)
     return [float(w) for w in word_list if w != ""]
 
 def convert_tokens_to_sentence(tokens):
@@ -66,11 +76,11 @@ def load_data(file_path):
     return df_original[['class', 'tokens', 'sentence']]
 
 
-def load_transformed_data(file_path):
+def load_transformed_data(file_path, dims=100):
     df_original = pd.read_excel(file_path, names=['class', 'tokens', 'sentence', 'top_tokens', 'features'])
     df_original['tokens'] = df_original['tokens'].apply(restore_tokens_from_text)
     df_original['top_tokens'] = df_original['top_tokens'].apply(restore_features_from_text)
-    df_original['features'] = df_original['features'].apply(restore_floats_from_text)
+    df_original['features'] = df_original['features'].apply(lambda x: restore_floats_from_text(x, dims))
     return df_original[['top_tokens', 'features', 'class']]
 
 def get_word_list_from_dataframe(df, col_name):
@@ -223,8 +233,9 @@ class TokensPicker(BaseEstimator, TransformerMixin):
             top_tokens.append('UNKNOWN')
         return top_tokens
 
-    def convert_tokens_to_features_with_weights(self, tokens, vectors, row_id):
+    def convert_tokens_to_features_with_weights(self, df, vectors, row_id):
         row = np.squeeze(vectors[row_id].toarray())
+        tokens = df.loc[row_id]['top_tokens']
         token_length = len(tokens)
         token_values = {}
         features = None
@@ -234,7 +245,7 @@ class TokensPicker(BaseEstimator, TransformerMixin):
             try:
                 if t in self.vectorizer.vocabulary_:
                     token_index = self.vectorizer.vocabulary_[t]
-                    token_value = row[token_index]
+                    token_value = row[token_index] * 1000
                     if t in self.w2v_model:
                         current_features = np.asarray(self.w2v_model[t]) * token_value
                         if features is None:
@@ -243,6 +254,10 @@ class TokensPicker(BaseEstimator, TransformerMixin):
                             features = np.vstack((features, current_features))
             except:
                 print("Exception: ", str(row_id))
+        try:
+            np.average(features, axis=0)
+        except:
+            return np.zeros(self.embedding_dim)
         return np.average(features, axis=0)
 
     def convert_tokens_to_features_1(self, tokens):
@@ -278,7 +293,8 @@ class TokensPicker(BaseEstimator, TransformerMixin):
                                                                        top_n=self.top_n_token),
                                     axis=1
                                   )
-        df['features'] = df['top_tokens'].apply(lambda x: self.convert_tokens_to_features_1(x))
+        df['features'] = df.apply(lambda x: self.convert_tokens_to_features_with_weights(df, vectors=self.vectors, row_id=x.name),
+                                  axis=1)
         writer_train = pd.ExcelWriter('transformed_topn-{0}_embeddingdim-{1}_window-{2}.xlsx'.format(self.top_n_token, self.embedding_dim, self.window))
         df.to_excel(writer_train, sheet_name='Sheet1')
         writer_train.save()
@@ -302,19 +318,20 @@ if __name__ == '__main__':
     training_path = '/home/alvin/!Final_Project/training_with_tokens.xlsx'
     testing_path = '/home/alvin/!Final_Project/testing_with_tokens.xlsx'
 
-    embedding_dim = 10
-    top_n_token = 10
+    # embedding_dim = 10
+    # top_n_token = 10
 
-    dims = [256, 512, 768]
+    dims = [768, 512, 256]
     top_ns = [10, 20, 30]
-    windows = [5, 8, 10]
+    windows = [10, 8, 5]
 
     cv_results = []
     for d in dims:
         for t in top_ns:
             for w in windows:
                 result = {'d': d, 't': t, 'w': w}
-                print('Load data, dim: {0}, top_n: {1}, windows: {2}.'.format(str(d), str(t), str(w)))
+                file_name = 'transformed_topn-{0}_embeddingdim-{1}_window-{2}.xlsx'.format(t, d, w)
+                print(file_name)
                 df_train = load_data(training_path)
 
                 feature_pipeline = Pipeline([
@@ -326,37 +343,52 @@ if __name__ == '__main__':
                                               min_child_weight=6, gamma=0,
                                               subsample=0.6, colsample_bytree=0.6, reg_alpha=0.05)
 
-                file_name = 'transformed_topn-{0}_embeddingdim-{1}_window-{2}.xlsx'.format(t, d, w)
-                df_traned = load_transformed_data(file_name)
+
+                df_traned = load_transformed_data(file_name, d)
+                # df_traned = x_train_transformed
                 _cv_results = cross_validate(xgb_final, np.asarray(df_traned['features'].tolist()),
                                              df_traned['class'].tolist(),
                                              return_train_score=False, scoring='accuracy', cv=5)
+                print(df_traned.loc[0]['features'])
+                print(_cv_results)
+
+                print('Average Score: ', np.asarray(_cv_results['test_score']))
+                print(np.average(_cv_results['test_score']))
                 result['score'] = np.average(_cv_results['test_score'])
                 result['fit_time'] = np.average(_cv_results['fit_time'])
                 result['score_time'] = np.average(_cv_results['score_time'])
                 cv_results.append(result)
-                print('Average Score: ', np.average(_cv_results['test_score']))
 
     df_results = pd.DataFrame.from_dict(cv_results)
-    df_results.to_csv('results_averaged.csv')
+    df_results.to_csv('results_with_weight.csv')
     #
     #
+    # result = {'d': 128, 't': 20, 'w': 10}
     # df_train = load_data(training_path)
     #
     # feature_pipeline = Pipeline([
-    #     ('Tokens_Picker_Pipeine', TokensPicker(embed_dim=50, top_n=10, window=5))
+    #     ('Tokens_Picker_Pipeine', TokensPicker(embed_dim=128, top_n=20, window=10))
     # ])
     # x_train_transformed = feature_pipeline.fit_transform(df_train)
-    # xgb_final = xgb.XGBClassifier(objective='auc_score', seed=11, learning_rate=0.1, n_estimators=215, max_depth=3,
+    # xgb_final = xgb.XGBClassifier(objective='auc_score', seed=11, learning_rate=0.1, n_estimators=215,
+    #                               max_depth=3,
     #                               min_child_weight=6, gamma=0,
     #                               subsample=0.6, colsample_bytree=0.6, reg_alpha=0.05)
     #
     # file_name = 'transformed_topn-{0}_embeddingdim-{1}_window-{2}.xlsx'.format(10, 50, 5)
     # df_traned = load_transformed_data(file_name)
-    # _cv_results = cross_validate(xgb_final, np.asarray(df_traned['features'].tolist()), df_traned['class'].tolist(),
+    # _cv_results = cross_validate(xgb_final, np.asarray(df_traned['features'].tolist()),
+    #                              df_traned['class'].tolist(),
     #                              return_train_score=False, scoring='accuracy', cv=5)
     # print(df_traned.loc[0]['features'])
     # print(_cv_results)
+    #
     # print('Average Score: ', np.asarray(_cv_results['test_score']))
     # print(np.average(_cv_results['test_score']))
+    # result['score'] = np.average(_cv_results['test_score'])
+    # result['fit_time'] = np.average(_cv_results['fit_time'])
+    # result['score_time'] = np.average(_cv_results['score_time'])
+    # cv_results.append(result)
+    # df_results = pd.DataFrame.from_dict(cv_results)
+    # df_results.to_csv('results_with_weight.csv')
     print('Done...')
